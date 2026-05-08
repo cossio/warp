@@ -512,6 +512,7 @@ use crate::terminal::{
 use crate::view_components::find::{Event as FindEvent, Find, FindDirection, FindWithinBlockState};
 use settings::{Setting, ToggleableSetting};
 use warp_core::semantic_selection::SemanticSelection;
+use warp_core::ui::theme::ColorScheme;
 use warpui::text::SelectionType;
 
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
@@ -21273,9 +21274,23 @@ impl TerminalView {
     fn handle_theme_change(&mut self, ctx: &mut ViewContext<Self>) {
         let appearance = Appearance::as_ref(ctx);
         let colors = color::List::from(&appearance.theme().clone().into());
-        let mut model = self.model.lock();
-        model.update_colors(colors);
+        let color_scheme = appearance.theme().inferred_color_scheme();
+        let should_notify = {
+            let mut model = self.model.lock();
+            model.update_colors(colors);
+            model.set_color_scheme(color_scheme)
+        };
         self.colors = colors;
+        if should_notify {
+            // CSI ? 997 ; 1 n = dark mode, CSI ? 997 ; 2 n = light mode
+            let code: u8 = if color_scheme == ColorScheme::LightOnDark {
+                1
+            } else {
+                2
+            };
+            let notification = format!("\x1b[?997;{code}n");
+            self.write_to_pty(notification.into_bytes(), ctx);
+        }
         ctx.notify();
     }
 

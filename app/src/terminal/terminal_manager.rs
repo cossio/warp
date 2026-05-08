@@ -104,10 +104,12 @@ pub(super) fn create_terminal_model(
     let is_ai_ugc_telemetry_enabled =
         should_collect_ai_ugc_telemetry(ctx, PrivacySettings::as_ref(ctx).is_telemetry_enabled);
 
+    let color_scheme = Appearance::as_ref(ctx).theme().inferred_color_scheme();
     TerminalModel::new(
         restored_blocks.map(|v| v.as_slice()),
         sizes,
         terminal_colors_list(ctx),
+        color_scheme,
         channel_event_proxy,
         ctx.background_executor().clone(),
         should_show_bootstrap_block,

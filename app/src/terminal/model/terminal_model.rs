@@ -84,6 +84,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use warp_core::features::FeatureFlag;
 use warp_core::semantic_selection::SemanticSelection;
+use warp_core::ui::theme::ColorScheme;
 pub use warp_terminal::model::BlockIndex;
 use warp_terminal::model::{KeyboardModes, KeyboardModesApplyBehavior};
 use warpui::assets::asset_cache::Asset;
@@ -476,6 +477,9 @@ pub struct TerminalModel {
 
     /// Default colors to render characters.
     colors: color::List,
+
+    /// Current terminal color scheme classification for `CSI ? 996 n`/`CSI ? 997 ; Ps n`.
+    color_scheme: ColorScheme,
 
     /// Color overrides set via escape sequence. If a color is not set here, the view determines the
     /// color based on the theme.
@@ -1049,6 +1053,7 @@ impl TerminalModel {
             restored_blocks,
             sizes,
             colors,
+            ColorScheme::LightOnDark,
             event_proxy,
             background_executor,
             should_show_bootstrap_block,
@@ -1091,6 +1096,7 @@ impl TerminalModel {
         restored_blocks: Option<&[SerializedBlockListItem]>,
         sizes: BlockSize,
         colors: color::List,
+        color_scheme: ColorScheme,
         event_proxy: ChannelEventListener,
         background_executor: Arc<Background>,
         should_show_bootstrap_block: bool,
@@ -1135,6 +1141,7 @@ impl TerminalModel {
             title: None,
             custom_title: None,
             colors,
+            color_scheme,
             override_colors: color::OverrideList::empty(),
             event_proxy,
             pending_legacy_ssh_session: None,
@@ -1178,6 +1185,7 @@ impl TerminalModel {
         restored_blocks: Option<&[SerializedBlockListItem]>,
         sizes: BlockSize,
         colors: color::List,
+        color_scheme: ColorScheme,
         event_proxy: ChannelEventListener,
         background_executor: Arc<Background>,
         should_show_bootstrap_block: bool,
@@ -1194,6 +1202,7 @@ impl TerminalModel {
             restored_blocks,
             sizes,
             colors,
+            color_scheme,
             event_proxy,
             background_executor,
             should_show_bootstrap_block,
@@ -1256,6 +1265,7 @@ impl TerminalModel {
             None,
             sizes,
             colors,
+            ColorScheme::LightOnDark,
             event_proxy,
             background_executor,
             false,
@@ -1877,6 +1887,28 @@ impl TerminalModel {
         self.colors = colors;
     }
 
+    fn should_notify_color_scheme_change(&self, classification_changed: bool) -> bool {
+        classification_changed
+            && self.is_term_mode_set(TermMode::DARK_LIGHT_NOTIFICATIONS)
+            && self
+                .block_list()
+                .active_block()
+                .is_active_and_long_running()
+    }
+
+    /// Updates stored color scheme classification and returns whether to emit a theme notification.
+    pub fn set_color_scheme(&mut self, color_scheme: ColorScheme) -> bool {
+        let classification_changed = self.color_scheme != color_scheme;
+        self.color_scheme = color_scheme;
+
+        self.should_notify_color_scheme_change(classification_changed)
+    }
+
+    /// Returns `true` when the current stored theme is dark mode.
+    pub fn is_dark_mode(&self) -> bool {
+        self.color_scheme == ColorScheme::LightOnDark
+    }
+
     pub fn raw_grid_for_ref_tests(&self) -> &GridHandler {
         if self.alt_screen_active {
             self.alt_screen.grid_handler()
@@ -2042,6 +2074,13 @@ impl TerminalModel {
         self.alt_screen
             .grid_handler_mut()
             .reset_keyboard_mode_state();
+
+        // Clear DarkLightNotifications opt-in so a previous alt-screen session
+        // that set ?2031 without unsetting it doesn't cause the next unrelated
+        // alt-screen app to receive unsolicited theme notifications.
+        self.alt_screen
+            .grid_handler_mut()
+            .unset_mode(ansi::Mode::DarkLightNotifications);
 
         if save_cursor_and_clear_screen {
             // Drop information about the primary screen's saved cursor.
@@ -2505,6 +2544,15 @@ impl ansi::Handler for TerminalModel {
         delegate!(self.device_status(writer, arg));
     }
 
+    fn report_color_scheme<W: std::io::Write>(&mut self, writer: &mut W) {
+        log::trace!("Reporting color scheme: is_dark={}", self.is_dark_mode());
+        // CSI ? 997 ; 1 n  → dark mode
+        // CSI ? 997 ; 2 n  → light mode
+        let code: u8 = if self.is_dark_mode() { 1 } else { 2 };
+        let response = format!("\x1b[?997;{code}n");
+        let _ = writer.write_all(response.as_bytes());
+    }
+
     fn move_forward(&mut self, columns: usize) {
         delegate!(self.move_forward(columns));
     }
@@ -2651,6 +2699,15 @@ impl ansi::Handler for TerminalModel {
             return;
         }
 
+        // DarkLightNotifications is scoped to the active grid: an application that opts
+        // in from the alt screen should not cause the main-grid session (which never
+        // opted in) to receive theme notifications after the alt screen exits.
+        if matches!(mode, ansi::Mode::DarkLightNotifications) {
+            delegate!(self.set_mode(mode));
+            self.emit_handler_event(HandlerEvent::SetMode { mode });
+            return;
+        }
+
         self.alt_screen.set_mode(mode);
         self.block_list.set_mode(mode);
         self.emit_handler_event(HandlerEvent::SetMode { mode });
@@ -2667,6 +2724,12 @@ impl ansi::Handler for TerminalModel {
             ansi::Mode::SyncOutput => {
                 // When synchronized output is turned off, we should redraw.
                 self.event_proxy.send_wakeup_event();
+            }
+            // DarkLightNotifications is scoped to the active grid only; see set_mode.
+            ansi::Mode::DarkLightNotifications => {
+                delegate!(self.unset_mode(mode));
+                self.emit_handler_event(HandlerEvent::UnsetMode { mode });
+                return;
             }
             _ => {}
         }
@@ -2781,6 +2844,8 @@ impl ansi::Handler for TerminalModel {
         // how to turn it off (and will never do so).  We forcibly unset the
         // mode to avoid getting stuck in this state.
         self.unset_mode(Mode::BracketedPaste);
+        // Mode `?2031` should not persist across command boundaries.
+        self.unset_mode(Mode::DarkLightNotifications);
 
         // Similar to bracketed paste, above, make sure we quit out of the
         // alt screen if we're currently in it.  This prevents issues where we
